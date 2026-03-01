@@ -1,0 +1,11 @@
+.env
+sessions/*.session
+sessions/*.session-journal
+__pycache__/
+*.pyc
+chroma_db/
+logs/*.log
+.vscode/
+.replit
+replit.nix
+.pythonlibs/
