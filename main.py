@@ -719,6 +719,331 @@ class GroupLogger:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  USER PROFILE MANAGER — досье на каждого (Идеи 13 + 15)
+# ═══════════════════════════════════════════════════════════════════
+
+class UserProfileManager:
+    """
+    Хранит профиль каждого пользователя:
+      - имя, возраст, город, профессия, интересы
+      - стиль общения (короткий / подробный / ироничный)
+    Сохраняется в JSON, не исчезает после перезапуска.
+    """
+
+    PROFILE_DIR = Path("user_profiles")
+
+    # Триггеры команд профиля
+    SAVE_TRIGGERS   = ["запомни —", "запомни -", "запомни: ", "запомни, что", "запомни что"]
+    VIEW_TRIGGERS   = ["что ты знаешь обо мне", "мой профиль", "что помнишь обо мне", "мои данные"]
+    CLEAR_TRIGGERS  = ["забудь всё что знаешь обо мне", "забудь всё обо мне",
+                       "удали мой профиль", "очисти мой профиль"]
+    STYLE_SHORT     = ["отвечай мне короче", "отвечай короче", "давай покороче",
+                       "отвечай кратко", "пиши кратко", "коротко"]
+    STYLE_LONG      = ["отвечай подробнее", "отвечай развёрнуто", "давай подробнее",
+                       "пиши подробно", "развёрнуто", "подробнее"]
+    STYLE_IRONIC    = ["отвечай с иронией", "можно с иронией", "добавь иронию", "с юмором"]
+    STYLE_NEUTRAL   = ["отвечай нейтрально", "убери иронию", "стандартный стиль"]
+
+    def __init__(self):
+        self.PROFILE_DIR.mkdir(exist_ok=True)
+
+    def _path(self, uid: int) -> Path:
+        return self.PROFILE_DIR / f"user_{uid}.json"
+
+    def load(self, uid: int) -> dict:
+        p = self._path(uid)
+        if not p.exists():
+            return {"uid": uid, "facts": [], "style": "normal"}
+        try:
+            return json.loads(p.read_text("utf-8"))
+        except Exception:
+            return {"uid": uid, "facts": [], "style": "normal"}
+
+    def save_profile(self, uid: int, profile: dict):
+        self._path(uid).write_text(
+            json.dumps(profile, ensure_ascii=False, indent=2), "utf-8"
+        )
+
+    def add_fact(self, uid: int, fact: str) -> str:
+        p = self.load(uid)
+        p.setdefault("facts", [])
+        # Не дублируем
+        if fact not in p["facts"]:
+            p["facts"].append(fact)
+        self.save_profile(uid, p)
+        return "Принято к сведению, Сэр. Обновил досье."
+
+    def get_summary(self, uid: int) -> str:
+        p = self.load(uid)
+        facts = p.get("facts", [])
+        style = p.get("style", "normal")
+        if not facts:
+            return "Досье пустое, Сэр. Расскажите о себе — запомню."
+        style_map = {"short": "краткий", "long": "подробный",
+                     "ironic": "ироничный", "normal": "стандартный"}
+        lines = ["Сэр, вот что я знаю о вас:"]
+        for f in facts:
+            lines.append(f"  • {f}")
+        lines.append(f"Стиль общения: {style_map.get(style, 'стандартный')}")
+        return "\n".join(lines)
+
+    def clear(self, uid: int) -> str:
+        p = self._path(uid)
+        if p.exists():
+            p.unlink()
+        return "Досье очищено, Сэр. Начинаем с чистого листа."
+
+    def set_style(self, uid: int, style: str) -> str:
+        p = self.load(uid)
+        p["style"] = style
+        self.save_profile(uid, p)
+        labels = {"short": "краткий", "long": "подробный",
+                  "ironic": "ироничный", "normal": "стандартный"}
+        return f"Принято, Сэр. Стиль общения: {labels.get(style, style)}."
+
+    def get_style(self, uid: int) -> str:
+        return self.load(uid).get("style", "normal")
+
+    def get_style_instruction(self, uid: int) -> str:
+        """Возвращает инструкцию для system prompt на основе стиля пользователя."""
+        style = self.get_style(uid)
+        if style == "short":
+            return "\n\nОТВЕЧАЙ ОЧЕНЬ КРАТКО. Максимум 2-3 предложения. Без лирики."
+        if style == "long":
+            return "\n\nОТВЕЧАЙ ПОДРОБНО. Развёрнуто, со структурой и деталями."
+        if style == "ironic":
+            return "\n\nОТВЕЧАЙ С ЛЁГКОЙ ИРОНИЕЙ. Умный юмор, не переусердствуй."
+        return ""
+
+    def get_context_for_llm(self, uid: int) -> str:
+        """Возвращает краткие факты о пользователе для добавления в контекст LLM."""
+        p = self.load(uid)
+        facts = p.get("facts", [])
+        if not facts:
+            return ""
+        return "Факты о пользователе: " + "; ".join(facts[:10])
+
+    @classmethod
+    def is_save(cls, q: str) -> tuple[bool, str]:
+        ql = q.lower()
+        for t in cls.SAVE_TRIGGERS:
+            if t in ql:
+                idx = ql.index(t) + len(t)
+                return True, q[idx:].strip()
+        return False, ""
+
+    @classmethod
+    def is_view(cls, q: str) -> bool:
+        ql = q.lower()
+        return any(t in ql for t in cls.VIEW_TRIGGERS)
+
+    @classmethod
+    def is_clear(cls, q: str) -> bool:
+        ql = q.lower()
+        return any(t in ql for t in cls.CLEAR_TRIGGERS)
+
+    @classmethod
+    def get_style_change(cls, q: str) -> str:
+        """Возвращает новый стиль или '' если не команда стиля."""
+        ql = q.lower()
+        if any(t in ql for t in cls.STYLE_SHORT):
+            return "short"
+        if any(t in ql for t in cls.STYLE_LONG):
+            return "long"
+        if any(t in ql for t in cls.STYLE_IRONIC):
+            return "ironic"
+        if any(t in ql for t in cls.STYLE_NEUTRAL):
+            return "normal"
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  REMINDER MANAGER — напоминания и будильники (Идея 6)
+# ═══════════════════════════════════════════════════════════════════
+
+class ReminderManager:
+    """
+    Хранит напоминания пользователей.
+    Фоновая задача каждую минуту проверяет что пора отправить.
+
+    Команды:
+      "Джарвис, напомни мне через 2 часа позвонить Ивану"
+      "Джарвис, напомни завтра в 9 утра сделать отчёт"
+      "Джарвис, мои напоминания"
+      "Джарвис, удали напоминание 1"
+    """
+
+    FILE = Path("reminders.json")
+
+    REMIND_TRIGGERS = [
+        "напомни мне", "напомни", "поставь будильник",
+        "поставь напоминание", "remind me", "set reminder",
+        "создай напоминание",
+    ]
+    LIST_TRIGGERS = [
+        "мои напоминания", "список напоминаний", "покажи напоминания",
+        "что запланировано", "my reminders",
+    ]
+    DEL_TRIGGERS = [
+        "удали напоминание", "отмени напоминание", "убери напоминание",
+        "delete reminder",
+    ]
+
+    def __init__(self):
+        self._data: list[dict] = []
+        self._load()
+
+    def _load(self):
+        if self.FILE.exists():
+            try:
+                self._data = json.loads(self.FILE.read_text("utf-8"))
+            except Exception:
+                self._data = []
+
+    def _save(self):
+        self.FILE.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), "utf-8")
+
+    def _next_id(self) -> int:
+        return max((r["id"] for r in self._data), default=0) + 1
+
+    def _parse_time(self, text: str) -> datetime | None:
+        """Парсит время из фразы типа 'через 2 часа', 'завтра в 9', '10.03 в 15:00'."""
+        from datetime import datetime, timedelta
+        import re as _re
+        now = datetime.now()
+        tl  = text.lower()
+
+        # "через N минут/часов/дней"
+        m = _re.search(r"через\s+(\d+)\s*(минут|час|день|дн)", tl)
+        if m:
+            n, unit = int(m.group(1)), m.group(2)
+            if "мин" in unit:   return now + timedelta(minutes=n)
+            if "час" in unit:   return now + timedelta(hours=n)
+            if "д" in unit:     return now + timedelta(days=n)
+
+        # "завтра в HH:MM" или "завтра в H"
+        m = _re.search(r"завтра\s+в\s+(\d{1,2})(?::(\d{2}))?", tl)
+        if m:
+            h, mn = int(m.group(1)), int(m.group(2) or 0)
+            t = (now + timedelta(days=1)).replace(hour=h, minute=mn, second=0, microsecond=0)
+            return t
+
+        # "в HH:MM" сегодня
+        m = _re.search(r"\bв\s+(\d{1,2}):(\d{2})", tl)
+        if m:
+            h, mn = int(m.group(1)), int(m.group(2))
+            t = now.replace(hour=h, minute=mn, second=0, microsecond=0)
+            if t <= now:
+                t += timedelta(days=1)
+            return t
+
+        # "в N утра/вечера"
+        m = _re.search(r"в\s+(\d{1,2})\s*(утра|вечера|ночи|дня)", tl)
+        if m:
+            h = int(m.group(1))
+            if m.group(2) in ("вечера", "ночи") and h < 12:
+                h += 12
+            t = now.replace(hour=h, minute=0, second=0, microsecond=0)
+            if t <= now:
+                t += timedelta(days=1)
+            return t
+
+        return None
+
+    def _parse_text(self, query: str) -> str:
+        """Извлекает текст напоминания из фразы."""
+        import re as _re
+        # Убираем временные части
+        query = _re.sub(
+            r"(через\s+\d+\s*\w+|завтра|сегодня|в\s+\d+[:\d]*\s*(утра|вечера|ночи|дня)?|напомни\s*(мне)?|поставь\s*(будильник|напоминание))",
+            "", query, flags=_re.IGNORECASE
+        ).strip(" ,.")
+        return query or "напоминание"
+
+    def add(self, uid: int, query: str) -> str:
+        fire_at = self._parse_time(query)
+        if not fire_at:
+            return ("Сэр, не понял когда напомнить. Примеры:\n"
+                    "• напомни через 2 часа позвонить Ивану\n"
+                    "• напомни завтра в 9 утра сделать отчёт\n"
+                    "• напомни в 18:30 встреча")
+        text = self._parse_text(query)
+        rid  = self._next_id()
+        from datetime import datetime as _dt
+        self._data.append({
+            "id":      rid,
+            "uid":     uid,
+            "text":    text,
+            "fire_at": fire_at.isoformat(),
+            "done":    False,
+        })
+        self._save()
+        time_str = fire_at.strftime("%d.%m %H:%M")
+        return f"Напоминание #{rid} установлено, Сэр. Напомню: {time_str} — {text}"
+
+    def list_for(self, uid: int) -> str:
+        from datetime import datetime as _dt
+        pending = [r for r in self._data if r["uid"] == uid and not r["done"]]
+        if not pending:
+            return "Сэр, активных напоминаний нет."
+        lines = [f"Ваши напоминания ({len(pending)} шт.):"]
+        for r in sorted(pending, key=lambda x: x["fire_at"]):
+            t = _dt.fromisoformat(r["fire_at"]).strftime("%d.%m %H:%M")
+            lines.append(f"  #{r['id']} [{t}] {r['text']}")
+        return "\n".join(lines)
+
+    def delete(self, uid: int, query: str) -> str:
+        import re as _re
+        m = _re.search(r"(\d+)", query)
+        if not m:
+            return "Сэр, укажите номер напоминания. Например: «удали напоминание 3»"
+        rid = int(m.group(1))
+        for r in self._data:
+            if r["uid"] == uid and r["id"] == rid:
+                r["done"] = True
+                self._save()
+                return f"Напоминание #{rid} удалено, Сэр."
+        return f"Сэр, напоминание #{rid} не найдено."
+
+    def get_due(self) -> list[dict]:
+        """Возвращает напоминания у которых наступило время."""
+        from datetime import datetime as _dt
+        now  = _dt.now()
+        due  = []
+        for r in self._data:
+            if r.get("done"):
+                continue
+            try:
+                if _dt.fromisoformat(r["fire_at"]) <= now:
+                    due.append(r)
+            except Exception:
+                pass
+        return due
+
+    def mark_done(self, rid: int):
+        for r in self._data:
+            if r["id"] == rid:
+                r["done"] = True
+        self._save()
+
+    @classmethod
+    def is_add(cls, q: str) -> bool:
+        ql = q.lower()
+        return any(t in ql for t in cls.REMIND_TRIGGERS)
+
+    @classmethod
+    def is_list(cls, q: str) -> bool:
+        ql = q.lower()
+        return any(t in ql for t in cls.LIST_TRIGGERS)
+
+    @classmethod
+    def is_delete(cls, q: str) -> bool:
+        ql = q.lower()
+        return any(t in ql for t in cls.DEL_TRIGGERS)
+
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  ГЛАВНЫЙ АГЕНТ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -737,6 +1062,8 @@ class JarvisAgent:
         self.chat_history = ChatHistory()
         self.phrase_bank  = PhraseBank()
         self.group_logger = GroupLogger()
+        self.profiles     = UserProfileManager()
+        self.reminders    = ReminderManager()
 
         # Per-user контекст — каждый пользователь имеет свою историю диалога
         self._user_context: dict[int, list[dict]] = {}
@@ -1004,6 +1331,10 @@ class JarvisAgent:
         if is_comparison:
             sys_p += "\n\nЭто запрос на сравнение/анализ. Дай подробный структурированный ответ: плюсы, минусы, итоговый вывод."
 
+        # Стиль общения пользователя
+        if sender_id:
+            sys_p += self.profiles.get_style_instruction(sender_id)
+
         # Берём контекст этого конкретного пользователя
         user_ctx = self._get_user_context(sender_id)
 
@@ -1011,10 +1342,15 @@ class JarvisAgent:
         messages += user_ctx  # вся история диалога с этим пользователем
 
         user_content = query
+        # Добавляем факты о пользователе в контекст
+        if sender_id:
+            profile_ctx = self.profiles.get_context_for_llm(sender_id)
+            if profile_ctx:
+                user_content = f"[{profile_ctx}]\n\n{query}"
         if rag_context:
-            user_content = f"[База знаний]\n{rag_context}\n\n[Вопрос]\n{query}"
+            user_content = f"[База знаний]\n{rag_context}\n\n[Вопрос]\n{user_content}"
         if context:
-            user_content = f"[Данные из интернета]\n{context[:6000]}\n\n[Вопрос]\n{query}"
+            user_content = f"[Данные из интернета]\n{context[:6000]}\n\n[Вопрос]\n{user_content}"
         messages.append({"role": "user", "content": user_content})
 
         answer = await self.llm.complete(messages)
@@ -1215,6 +1551,47 @@ class JarvisAgent:
         if qa := self.check_qa(query):
             self.chat_history.save_message(sender_id, "jarvis", qa)
             return qa
+
+        # 1b. Профиль — запомни факт (Идея 13)
+        is_fact, fact_text = UserProfileManager.is_save(query)
+        if is_fact and fact_text:
+            answer = self.profiles.add_fact(sender_id, fact_text)
+            return answer
+
+        if UserProfileManager.is_view(query):
+            return self.profiles.get_summary(sender_id)
+
+        if UserProfileManager.is_clear(query):
+            return self.profiles.clear(sender_id)
+
+        # 1c. Стиль общения (Идея 15)
+        new_style = UserProfileManager.get_style_change(query)
+        if new_style:
+            return self.profiles.set_style(sender_id, new_style)
+
+        # 1d. Напоминания (Идея 6)
+        if ReminderManager.is_list(query):
+            return self.reminders.list_for(sender_id)
+
+        if ReminderManager.is_delete(query):
+            return self.reminders.delete(sender_id, query)
+
+        if ReminderManager.is_add(query):
+            return self.reminders.add(sender_id, query)
+
+        # 1e. Перевод (Идея 9)
+        _TRANSLATE_TRIGGERS = [
+            "переведи на", "переведи с", "переведи текст",
+            "переведи:", "перевести на", "translate to", "translate from",
+        ]
+        if any(t in q_lower for t in _TRANSLATE_TRIGGERS):
+            translate_prompt = (
+                f"Переведи следующий текст точно и без пояснений. "
+                f"Верни ТОЛЬКО перевод, без вступлений и комментариев:\n\n{query}"
+            )
+            answer = await self.call_llm(query=translate_prompt, sender_id=sender_id)
+            self.chat_history.save_message(sender_id, "jarvis", answer)
+            return answer
 
         # 2. История
         if ChatHistory.is_history_request(query):
@@ -1429,6 +1806,24 @@ class JarvisTelegram:
             config.TELEGRAM_API_HASH,
         )
         logger.info(f"Telegram mode: {'BOT' if self.is_bot else 'USER'}, session: {session_file}")
+
+    async def _reminder_loop(self):
+        """Каждую минуту проверяет наступившие напоминания и отправляет сообщения."""
+        while True:
+            try:
+                due = self.agent.reminders.get_due()
+                for r in due:
+                    try:
+                        await self.client.send_message(
+                            r["uid"],
+                            f"⏰ Сэр, напоминаю: {r['text']}"
+                        )
+                        self.agent.reminders.mark_done(r["id"])
+                    except Exception as e:
+                        logger.warning(f"Reminder send failed: {e}")
+            except Exception as e:
+                logger.warning(f"Reminder loop error: {e}")
+            await asyncio.sleep(60)
 
     async def start(self):
         if self.is_bot:
@@ -1971,6 +2366,8 @@ async def main():
                 "   Запусти python create_session.py чтобы включить логирование групп.[/yellow]"
             )
 
+        # Напоминания — фоновая задача
+        tasks.append(asyncio.create_task(tg._reminder_loop()))
         await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
