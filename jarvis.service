@@ -1,0 +1,16 @@
+[Unit]
+Description=JARVIS Telegram Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/jarvis
+ExecStart=/home/YOUR_USERNAME/jarvis/.venv/bin/python run.py
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+[Install]
+WantedBy=multi-user.target
