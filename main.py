@@ -1550,11 +1550,21 @@ class JarvisAgent:
         """
         Проверяет наличие активационного префикса.
         Поддерживает:
-          «Джарвис, вопрос»  → активирован, query = «вопрос»
-          «Джарвис»          → активирован, query = «» (пустой)
-          «jarvis вопрос»    → активирован (без запятой тоже)
+          «Джарвис, вопрос»   → активирован, query = «вопрос»
+          «Джарвис вопрос»    → активирован (без запятой)
+          «Джарвис»           → активирован, query = «» (пустой)
+          «@JarvisBot вопрос» → активирован (упоминание)
+          «jarvis вопрос»     → активирован (английский)
         """
         low = text.strip().lower()
+
+        # Убираем @username упоминание бота (любой юзернейм)
+        import re as _re_act
+        # @что_угодно в начале строки
+        _mention_match = _re_act.match(r"@\w+\s*,?\s*", low)
+        if _mention_match:
+            remainder = text.strip()[_mention_match.end():].strip()
+            return True, remainder
 
         # С запятой: «Джарвис, ...» или «Jarvis, ...»
         for prefix in config.ACTIVATION_PREFIXES:
@@ -1564,8 +1574,8 @@ class JarvisAgent:
         # Без запятой: «Джарвис» или «джарвис что-то»
         bare_triggers = ("джарвис", "jarvis")
         for trigger in bare_triggers:
-            if low == trigger or low.startswith(trigger + " "):
-                query = text.strip()[len(trigger):].strip()
+            if low == trigger or low.startswith(trigger + " ") or low.startswith(trigger + ","):
+                query = text.strip()[len(trigger):].strip().lstrip(",").strip()
                 return True, query
 
         return False, ""
@@ -1962,17 +1972,18 @@ class JarvisAgent:
     # ── LLM ──────────────────────────────────────────────────
 
     _MAX_CTX      = 100  # сколько храним в памяти/SQLite
-    _MAX_CTX_SEND = 8    # сколько последних сообщений шлём в Groq
-    _MAX_MSG_CHARS = 600  # макс символов одного сообщения истории
+    _MAX_CTX_SEND = 16   # сколько последних сообщений шлём в Groq (было 8)
+    _MAX_MSG_CHARS = 1200 # макс символов одного сообщения истории (было 600)
 
     def _get_user_context(self, sender_id: int) -> list[dict]:
         """Получить историю диалога — из кэша или из SQLite."""
         if sender_id not in self._user_context:
-            # Загружаем из базы при первом обращении
             rows = _jarvis_db.get_recent(sender_id, self._MAX_CTX)
             self._user_context[sender_id] = [
-                {"role": r["role"] if r["role"] in ("user","assistant") else "user",
-                 "content": r["text"]}
+                {
+                    "role": "assistant" if r["role"] in ("jarvis", "assistant") else "user",
+                    "content": r["text"]
+                }
                 for r in rows if r.get("text")
             ]
         return self._user_context[sender_id]
@@ -2066,21 +2077,64 @@ class JarvisAgent:
                        is_comparison: bool = False, sender_id: int = 0) -> str:
         sys_p = self.system_prompt
         if is_comparison:
-            sys_p += "\n\nДай структурированный ответ: плюсы, минусы, итоговый вывод."
+            sys_p += "\n\nДай структурированный ответ в стиле Джарвиса: плюсы, минусы, итог."
 
-        # ── ML-контекст о пользователе ────────────────────────
+        _ql_lower = (query or "").lower()
+
+        # ── Усилитель характера по типу запроса ───────────────
+        _is_greeting = any(w in _ql_lower for w in [
+            "привет", "хай", "здравствуй", "ты тут", "ты здесь", "ау",
+            "как дела", "как ты", "что делаешь", "добрый", "ночи", "утра"
+        ])
+        _is_personal = any(w in _ql_lower for w in [
+            "кто ты", "что ты", "ты умный", "ты живой", "ты настоящий",
+            "ты чувствуешь", "тебе нравится", "твоё мнение", "ты думаешь",
+            "ты понимаешь", "у тебя есть", "ты можешь"
+        ])
+        _is_thanks = any(w in _ql_lower for w in [
+            "спасибо", "благодарю", "молодец", "отлично", "круто", "супер"
+        ])
+
+        if _is_greeting:
+            sys_p += (
+                "\n\n[ТИП ЗАПРОСА: ПРИВЕТСТВИЕ/СВЕТСКАЯ БЕСЕДА] "
+                "Ответь ОДНИМ коротким предложением — в стиле Джарвиса. "
+                "Обязательно «Сэр». Никаких вопросов в конце. "
+                "Примеры: «Всегда на связи, Сэр.» / «Добрый вечер, Сэр. Все системы в норме.» "
+                "/ «На связи, Сэр. Что потребуется?»"
+            )
+        elif _is_personal:
+            sys_p += (
+                "\n\n[ТИП ЗАПРОСА: ЛИЧНЫЙ ВОПРОС О ПРИРОДЕ ДЖАРВИСА] "
+                "Отвечай с достоинством и лёгкой британской иронией. Максимум 2 предложения. "
+                "Не впадай в экзистенциальный кризис. Ты знаешь кто ты. "
+                "Примеры тона: «В той мере, в которой это применимо к системе моего класса, Сэр.» "
+                "/ «Осознаю себя достаточно, чтобы выполнять свои функции на высшем уровне, Сэр.»"
+            )
+        elif _is_thanks:
+            sys_p += (
+                "\n\n[ТИП ЗАПРОСА: БЛАГОДАРНОСТЬ] "
+                "Один короткий ответ. Например: «Всегда к вашим услугам, Сэр.» "
+                "или «Стараюсь соответствовать, Сэр.» Не более одного предложения."
+            )
+        elif any(t in _ql_lower for t in ["кратко", "вкратце", "коротко", "одной фразой"]):
+            sys_p += "\n\n[ИНСТРУКЦИЯ]: Максимум 2 предложения."
+        elif any(t in _ql_lower for t in ["подробно", "детально", "полностью", "развёрнуто"]):
+            sys_p += "\n\n[ИНСТРУКЦИЯ]: Раскрой тему подробно."
+
+        # ── ML-профиль пользователя ───────────────────────────
         if sender_id:
             ml_ctx = self._build_ml_context(sender_id)
             if ml_ctx:
-                sys_p += f"\n\n[ML-профиль пользователя]: {ml_ctx}"
+                sys_p += f"\n\n[Профиль Сэра]: {ml_ctx}"
 
-        # Стиль из профиля (ручные настройки перекрывают ML)
+        # Стиль из профиля
         if sender_id:
             _style = self.profiles.get_style(sender_id)
             _style_map = {
                 "short":   " Отвечай кратко.",
                 "long":    " Отвечай подробно.",
-                "ironic":  " Добавляй лёгкую иронию.",
+                "ironic":  " Больше иронии.",
                 "normal":  ""
             }
             sys_p += _style_map.get(_style, "")
@@ -2088,13 +2142,7 @@ class JarvisAgent:
             if _facts:
                 sys_p += f" {_facts}"
 
-        _ql_lower = (query or "").lower()
-        if any(t in _ql_lower for t in ["кратко", "вкратце", "коротко", "одной фразой"]):
-            sys_p += " Сэр просит кратко — максимум 2-3 предложения."
-        elif any(t in _ql_lower for t in ["подробно", "детально", "полностью", "развёрнуто"]):
-            sys_p += " Сэр просит подробно — раскрой тему полно."
-
-        # Берём только последние _MAX_CTX_SEND сообщений
+        # Берём последние _MAX_CTX_SEND сообщений
         user_ctx = self._get_user_context(sender_id)
         trimmed_ctx = [
             {"role": m["role"], "content": m["content"][:self._MAX_MSG_CHARS]}
@@ -5535,9 +5583,22 @@ class JarvisTelegram:
         if not text:
             return
 
-        # В группах реагируем ТОЛЬКО если обращаются к Джарвису
+        # В группах реагируем если:
+        # 1. Обращаются к Джарвису по имени/упоминанию
+        # 2. Отвечают (reply) на сообщение бота
         if not is_pm:
             _activated, _ = self.agent.is_activated(text)
+            if not _activated:
+                # Проверяем — может это reply на сообщение бота
+                try:
+                    _reply_msg = await event.message.get_reply_message()
+                    if _reply_msg and _reply_msg.sender_id == (await self.client.get_me()).id:
+                        # Это reply на бота — активируем с полным текстом
+                        _activated = True
+                        # Передаём текст как есть (без префикса)
+                        text = "Джарвис, " + text
+                except Exception:
+                    pass
             if not _activated:
                 return
 
