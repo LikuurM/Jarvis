@@ -1202,3 +1202,105 @@ class JarvisDB:
         except Exception as e:
             return {"error": str(e)}
 
+
+    # ══════════════════════════════════════════
+    # VK — ВКонтакте
+    # ══════════════════════════════════════════
+
+    def _ensure_vk_tables(self):
+        """Создаёт VK-таблицы если не существуют. Автомиграция."""
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS vk_chats (
+                chat_id     INTEGER PRIMARY KEY,
+                chat_type   TEXT    DEFAULT 'pm',   -- pm / chat / group
+                title       TEXT    DEFAULT '',
+                peer_id     INTEGER DEFAULT 0,
+                last_seen   TEXT    DEFAULT (datetime('now','+3 hours')),
+                msg_count   INTEGER DEFAULT 0
+            )
+        """)
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS vk_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                vk_msg_id   INTEGER DEFAULT 0,
+                chat_id     INTEGER NOT NULL,
+                peer_id     INTEGER NOT NULL,
+                from_id     INTEGER NOT NULL,
+                sender_name TEXT    DEFAULT '',
+                role        TEXT    DEFAULT 'user',   -- user / jarvis
+                text        TEXT    NOT NULL,
+                ts          TEXT    DEFAULT (datetime('now','+3 hours'))
+            )
+        """)
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_vk_msg_chat ON vk_messages(chat_id)"
+        )
+        self._execute(
+            "CREATE INDEX IF NOT EXISTS idx_vk_msg_from ON vk_messages(from_id)"
+        )
+
+    def vk_register_chat(self, peer_id: int, chat_type: str = "pm", title: str = ""):
+        """Регистрирует VK чат/беседу."""
+        try:
+            self._ensure_vk_tables()
+            self._execute(
+                "INSERT OR IGNORE INTO vk_chats (chat_id, chat_type, title, peer_id) VALUES (?,?,?,?)",
+                (peer_id, chat_type, title or "", peer_id)
+            )
+            self._execute(
+                "UPDATE vk_chats SET last_seen=datetime('now','+3 hours'), title=? WHERE chat_id=?",
+                (title or "", peer_id)
+            )
+        except Exception as e:
+            logger.debug(f"vk_register_chat: {e}")
+
+    def vk_save_message(self, peer_id: int, from_id: int, sender_name: str,
+                        text: str, role: str = "user", vk_msg_id: int = 0):
+        """Сохраняет сообщение из ВК."""
+        try:
+            self._ensure_vk_tables()
+            # Определяем тип чата
+            chat_type = "chat" if peer_id > 2_000_000_000 else "pm"
+            self.vk_register_chat(peer_id, chat_type)
+            self._execute(
+                "INSERT INTO vk_messages (vk_msg_id, chat_id, peer_id, from_id, "
+                "sender_name, role, text) VALUES (?,?,?,?,?,?,?)",
+                (vk_msg_id, peer_id, peer_id, from_id, sender_name, role, text[:2000])
+            )
+            self._execute(
+                "UPDATE vk_chats SET msg_count=msg_count+1, "
+                "last_seen=datetime('now','+3 hours') WHERE chat_id=?",
+                (peer_id,)
+            )
+        except Exception as e:
+            logger.debug(f"vk_save_message: {e}")
+
+    def vk_get_history(self, peer_id: int, limit: int = 20) -> list:
+        """Возвращает историю VK чата."""
+        try:
+            self._ensure_vk_tables()
+            return self._execute(
+                "SELECT from_id, sender_name, role, text, ts FROM vk_messages "
+                "WHERE peer_id=? ORDER BY id DESC LIMIT ?",
+                (peer_id, limit), fetch="all"
+            ) or []
+        except Exception:
+            return []
+
+    def vk_get_stats(self) -> dict:
+        """Статистика VK."""
+        try:
+            self._ensure_vk_tables()
+            chats = self._execute("SELECT COUNT(*) as n FROM vk_chats", fetch="one") or {}
+            msgs  = self._execute("SELECT COUNT(*) as n FROM vk_messages", fetch="one") or {}
+            users = self._execute(
+                "SELECT COUNT(DISTINCT from_id) as n FROM vk_messages WHERE role='user'",
+                fetch="one"
+            ) or {}
+            return {
+                "chats":    chats.get("n", 0),
+                "messages": msgs.get("n", 0),
+                "users":    users.get("n", 0),
+            }
+        except Exception as e:
+            return {"error": str(e)}
