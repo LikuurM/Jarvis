@@ -1486,7 +1486,8 @@ class JarvisAgent:
         self.embeddings = None  # RAG/embeddings отключён
         self.system_prompt: str = ""
 
-        self._fwd_buffer  : dict[int, list[dict]] = {}
+        self._fwd_buffer    : dict[int, list[dict]] = {}
+        self._bot_username  : str = ""   # юзернейм бота — ставится при старте TG
 
         self._init_vectorstore()
         self._load_qa()
@@ -1560,12 +1561,12 @@ class JarvisAgent:
         _mention_match = _re_act.match(r"@(\w+)\s*,?\s*", low)
         if _mention_match:
             mentioned = _mention_match.group(1).lower()
-            bot_un = getattr(self, "_bot_username", "").lower().lstrip("@")
-            # Реагируем только если упомянули именно бота
+            bot_un = self._bot_username.lower().lstrip("@")
             if bot_un and mentioned == bot_un:
+                # Это наш бот — активируем
                 remainder = text.strip()[_mention_match.end():].strip()
                 return True, remainder
-            # Чужой @username — игнорируем
+            # Чужой @username или юзернейм ещё не загружен — НЕ активируем
             return False, ""
 
         # С запятой: «Джарвис, ...» / «Jarvis, ...»
