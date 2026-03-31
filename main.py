@@ -29,6 +29,14 @@ from loguru import logger
 # ── Конфиг ────────────────────────────────────────────────────
 import config
 import db as _db
+
+# ── Архив знаний (опционально) ────────────────────────────────
+try:
+    from archive_client import archive_search as _archive_search
+    _ARCHIVE_AVAILABLE = bool(os.getenv("ARCHIVE_API_URL"))
+except ImportError:
+    _archive_search = None
+    _ARCHIVE_AVAILABLE = False
 _jarvis_db = _db.get_db()
 
 # ── Настройка loguru ──────────────────────────────────────────
@@ -2737,6 +2745,14 @@ class JarvisAgent:
             self.chat_history.save_message(sender_id, "jarvis", full_answer)
             return full_answer
 
+        # ── Поиск в Архиве знаний ─────────────────────────────
+        _archive_ctx = ""
+        if _ARCHIVE_AVAILABLE and _archive_search:
+            try:
+                _archive_ctx = await _archive_search(query, limit=3)
+            except Exception:
+                pass
+
         # ── ВСЕ остальные запросы — умный роутер ─────────────
         # Определяем: отвечать как человек или искать в интернете
 
@@ -2795,7 +2811,8 @@ class JarvisAgent:
 
         # Если это явно разговор И не нужен поиск — отвечаем как человек
         if _is_chat_msg and not _needs_search:
-            answer = await self.call_llm(query=query, rag_context=rag_context, sender_id=sender_id)
+            _combined_rag = "\n\n".join(filter(None, [rag_context, _archive_ctx]))
+            answer = await self.call_llm(query=query, rag_context=_combined_rag or None, sender_id=sender_id)
             phrase = self.phrase_bank.get(context=query + " " + answer, chance=0.15)
             full_answer = answer + phrase
             self.chat_history.save_message(sender_id, "jarvis", full_answer)
@@ -2820,6 +2837,9 @@ class JarvisAgent:
             web = "\n\n".join(search_results)
 
         # AI отвечает на основе найденных данных
+        # Добавляем данные из Архива к контексту
+        if _archive_ctx:
+            web = f"[Из архива знаний]:\n{_archive_ctx}\n\n[Из интернета]:\n{web}"
         answer = await self.call_llm(
             query=query, context=web,
             rag_context=rag_context,
@@ -3792,8 +3812,8 @@ class MediaHandler:
 
     # Vision через Groq (llama с поддержкой изображений)
     VISION_MODELS = [
-        "llama-3.2-90b-vision-preview",
-        "llama-3.2-11b-vision-preview",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
     ]
 
     @staticmethod
@@ -5984,7 +6004,56 @@ async def main():
         except Exception as _vk_e:
             logger.warning(f"⚠️ VK бот не запущен: {_vk_e}")
 
-        tasks = [asyncio.create_task(tg.start())]
+        # Проверяем подключение к Архиву и уведомляем владельца
+        async def _check_archive_on_start():
+            """Проверяет Архив после подключения Telegram и шлёт статус владельцу."""
+            await asyncio.sleep(5)  # ждём пока Telegram поднимется
+            if not config.OWNER_ID:
+                return
+            archive_url = os.getenv("ARCHIVE_API_URL", "")
+            archive_key = os.getenv("ARCHIVE_API_KEY", "")
+            if not archive_url:
+                return  # Архив не настроен — молчим
+            try:
+                async with httpx.AsyncClient(timeout=5) as _ac:
+                    _ar = await _ac.get(
+                        f"{archive_url.rstrip('/')}/health",
+                        headers={"X-API-Key": archive_key}
+                    )
+                if _ar.status_code == 200:
+                    # Получаем статистику
+                    try:
+                        _sr = await _ac.get(
+                            f"{archive_url.rstrip('/')}/stats",
+                            headers={"X-API-Key": archive_key}
+                        )
+                        _st = _sr.json() if _sr.status_code == 200 else {}
+                    except Exception:
+                        _st = {}
+                    _docs  = _st.get("docs", "?")
+                    _pages = _st.get("pages", "?")
+                    await tg.client.send_message(
+                        config.OWNER_ID,
+                        f"✅ **Архив знаний подключён**, Сэр.\n"
+                        f"📄 Документов: **{_docs}** | 📃 Страниц: **{_pages}**"
+                    )
+                    logger.info(f"✅ Архив знаний доступен: {_docs} документов")
+                else:
+                    raise Exception(f"статус {_ar.status_code}")
+            except Exception as _ae:
+                logger.warning(f"⚠️ Архив недоступен: {_ae}")
+                try:
+                    await tg.client.send_message(
+                        config.OWNER_ID,
+                        f"⚠️ **Архив знаний недоступен**, Сэр.\n"
+                        f"Ошибка: `{str(_ae)[:100]}`\n"
+                        f"Джарвис работает без архива — отвечаю из своих знаний."
+                    )
+                except Exception:
+                    pass
+
+        tasks = [asyncio.create_task(tg.start()),
+                 asyncio.create_task(_check_archive_on_start())]
 
         # GroupMonitor запускается только если есть user.session
         from pathlib import Path as _Path
