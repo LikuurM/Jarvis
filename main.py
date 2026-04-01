@@ -32,10 +32,16 @@ import db as _db
 
 # ── Архив знаний (опционально) ────────────────────────────────
 try:
-    from archive_client import archive_search as _archive_search
+    from archive_client import (
+        archive_search  as _archive_search,
+        archive_health  as _archive_health,
+        archive_stats   as _archive_stats,
+    )
     _ARCHIVE_AVAILABLE = bool(os.getenv("ARCHIVE_API_URL"))
 except ImportError:
-    _archive_search = None
+    _archive_search  = None
+    _archive_health  = None
+    _archive_stats   = None
     _ARCHIVE_AVAILABLE = False
 _jarvis_db = _db.get_db()
 
@@ -6011,42 +6017,36 @@ async def main():
             if not config.OWNER_ID:
                 return
             archive_url = os.getenv("ARCHIVE_API_URL", "")
-            archive_key = os.getenv("ARCHIVE_API_KEY", "")
             if not archive_url:
                 return  # Архив не настроен — молчим
             try:
-                async with httpx.AsyncClient(timeout=5) as _ac:
-                    _ar = await _ac.get(
-                        f"{archive_url.rstrip('/')}/health",
-                        headers={"X-API-Key": archive_key}
+                if _archive_health is None:
+                    raise ImportError("archive_client.py не найден рядом с main.py")
+                ok = await _archive_health()
+                if not ok:
+                    raise ConnectionError(
+                        f"сервер не ответил — убедитесь что Archive бот запущен "
+                        f"и URL={archive_url} верный"
                     )
-                if _ar.status_code == 200:
-                    # Получаем статистику
-                    try:
-                        _sr = await _ac.get(
-                            f"{archive_url.rstrip('/')}/stats",
-                            headers={"X-API-Key": archive_key}
-                        )
-                        _st = _sr.json() if _sr.status_code == 200 else {}
-                    except Exception:
-                        _st = {}
-                    _docs  = _st.get("docs", "?")
-                    _pages = _st.get("pages", "?")
-                    await tg.client.send_message(
-                        config.OWNER_ID,
-                        f"✅ **Архив знаний подключён**, Сэр.\n"
-                        f"📄 Документов: **{_docs}** | 📃 Страниц: **{_pages}**"
-                    )
-                    logger.info(f"✅ Архив знаний доступен: {_docs} документов")
-                else:
-                    raise Exception(f"статус {_ar.status_code}")
+                st     = (await _archive_stats()) if _archive_stats else {}
+                _docs  = st.get("docs", "?")
+                _pages = st.get("pages", "?")
+                await tg.client.send_message(
+                    config.OWNER_ID,
+                    f"✅ **Архив знаний подключён**, Сэр.\n"
+                    f"📄 Документов: **{_docs}** | 📃 Страниц: **{_pages}**"
+                )
+                logger.info(f"✅ Архив знаний доступен: {_docs} документов")
             except Exception as _ae:
                 logger.warning(f"⚠️ Архив недоступен: {_ae}")
                 try:
                     await tg.client.send_message(
                         config.OWNER_ID,
                         f"⚠️ **Архив знаний недоступен**, Сэр.\n"
-                        f"Ошибка: `{str(_ae)[:100]}`\n"
+                        f"URL: `{archive_url}`\n"
+                        f"Ошибка: `{str(_ae)[:150]}`\n\n"
+                        f"Проверьте что Archive бот запущен и в .env Джарвиса "
+                        f"правильно заданы `ARCHIVE_API_URL` и `ARCHIVE_API_KEY`.\n"
                         f"Джарвис работает без архива — отвечаю из своих знаний."
                     )
                 except Exception:
