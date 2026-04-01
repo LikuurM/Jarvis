@@ -12,7 +12,7 @@ log = logging.getLogger("jarvis.archive_client")
 
 
 def _url() -> str:
-    return os.getenv("ARCHIVE_API_URL", "http://172.19.0.105:8765").rstrip("/")
+    return os.getenv("ARCHIVE_API_URL", "https://Archive.bothost.ru").rstrip("/")
 
 def _key() -> str:
     return os.getenv("ARCHIVE_API_KEY", "ArchiveJarvisHost")
