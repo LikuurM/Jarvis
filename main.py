@@ -37,7 +37,8 @@ try:
         archive_health  as _archive_health,
         archive_stats   as _archive_stats,
     )
-    _ARCHIVE_AVAILABLE = bool(os.getenv("ARCHIVE_API_URL"))
+    # Архив доступен если задан URL ИЛИ если archive_client.py есть (там захардкожен IP)
+    _ARCHIVE_AVAILABLE = True
 except ImportError:
     _archive_search  = None
     _archive_health  = None
@@ -3824,17 +3825,41 @@ class MediaHandler:
 
     @staticmethod
     async def describe_photo(image_bytes: bytes, question: str = "") -> str:
-        """Описывает фото через vision LLM. Перебирает модели пока одна не ответит."""
+        """Анализирует фото через vision LLM — умный универсальный промпт."""
         import base64
-        b64    = base64.b64encode(image_bytes).decode()
-        prompt = question or "Подробно опиши что на этом изображении на русском языке."
-        msgs   = [{
+        b64 = base64.b64encode(image_bytes).decode()
+
+        # Умный системный промпт — определяет тип изображения и действует соответственно
+        system_prompt = """Ты — JARVIS, интеллектуальный ИИ-ассистент. Анализируй изображение умно:
+
+• Если на фото МАТЕМАТИКА / ФИЗИКА / ХИМИЯ (уравнения, задачи, формулы) → реши задачу пошагово, дай ответ
+• Если на фото ТЕКСТ / ДОКУМЕНТ / СТАТЬЯ → кратко перескажи суть, выдели главное (не переписывай дословно)
+• Если на фото ГРАФИК / ДИАГРАММА / ТАБЛИЦА → объясни что показывает, выдели ключевые данные
+• Если на фото КОД / ПРОГРАММА → объясни что делает, найди ошибки если есть
+• Если на фото СКРИНШОТ ОШИБКИ → диагностируй проблему, предложи решение
+• Если на фото ЧЕРТЁЖ / СХЕМА → объясни устройство или принцип работы
+• Если на фото ФОТО МЕСТА / ОБЪЕКТА / ЧЕЛОВЕКА / ПРИРОДЫ → опиши что видишь, дай контекст
+• Если на фото ЕДА / РЕЦЕПТ → назови блюдо, если есть рецепт — перескажи кратко
+• Если пользователь задал конкретный вопрос — отвечай именно на него
+
+Отвечай на русском языке. Будь точным и полезным. Не пиши "на изображении я вижу" — сразу по делу."""
+
+        if question and len(question.strip()) > 2:
+            user_text = question.strip()
+        else:
+            user_text = "Проанализируй это изображение."
+
+        msgs = [{
+            "role": "system",
+            "content": system_prompt,
+        }, {
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": prompt}
+                {"type": "text", "text": user_text}
             ]
         }]
+
         import os as _os_vis, concurrent.futures as _cf_vis
         _gk_vis = _os_vis.getenv("GROQ_API_KEY", "")
         if not (_GROQ_AVAILABLE and _gk_vis):
@@ -3845,7 +3870,7 @@ class MediaHandler:
                 def _vis_call(_m=model):
                     vc = _GroqClient(api_key=_gk_vis)
                     return vc.chat.completions.create(
-                        model=_m, messages=msgs, max_completion_tokens=600,
+                        model=_m, messages=msgs, max_completion_tokens=1200,
                     ).choices[0].message.content.strip()
                 loop = asyncio.get_event_loop()
                 with _cf_vis.ThreadPoolExecutor(max_workers=1) as _ex_vis:
@@ -5176,22 +5201,34 @@ class JarvisTelegram:
             if media_type == "sticker":
                 return
 
-            # ── В группах обрабатываем только голосовые ───────
-            if not is_pm and media_type not in ("voice", "audio"):
-                return
+            # ── В группах: фото с "Джарвис" в подписи — обрабатываем
+            # Остальные медиа в группах — только голосовые
+            if not is_pm:
+                _txt_low = (text or "").lower()
+                _has_jarvis = any(p in _txt_low for p in ("джарвис", "jarvis", "@" + self._bot_username.lower()))
+                if media_type == "photo" and _has_jarvis:
+                    pass  # разрешаем обработку
+                elif media_type in ("voice", "audio"):
+                    pass  # голосовые всегда обрабатываем
+                else:
+                    return
 
             _typing_m = TypingManager(self.client, event.chat_id)
             await _typing_m.start()
             try:
                 if media_type == "photo":
-                    # Фото: только если есть "Джарвис" в подписи
-                    _txt_low = (text or "").lower()
-                    if not any(p in _txt_low for p in ("джарвис", "jarvis")):
-                        return
+                    # Фото: извлекаем вопрос из подписи (убираем "Джарвис,")
+                    import re as _re_ph
+                    _txt_clean = _re_ph.sub(
+                        r"(?i)(джарвис[,\s]*|jarvis[,\s]*|@\w+[,\s]*)", "", text or ""
+                    ).strip()
+                    question = _txt_clean if len(_txt_clean) > 2 else ""
                     file_bytes = await self.client.download_media(msg, bytes)
-                    question   = text if text and len(text) > 2 else "Опиши что на фото"
+                    if not file_bytes:
+                        await event.reply("Сэр, не удалось скачать фото.")
+                        return
                     desc = await MediaHandler.describe_photo(file_bytes, question)
-                    await event.reply(f"🖼 {desc}")
+                    await event.reply(f"{desc}")
                     return
                 elif media_type == "voice":
                     file_bytes = await self.client.download_media(msg, bytes)
