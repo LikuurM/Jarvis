@@ -14,7 +14,7 @@ def _url() -> str:
     return os.getenv("ARCHIVE_API_URL", "http://localhost:8765").rstrip("/")
 
 def _key() -> str:
-    return os.getenv("ARCHIVE_API_KEY", "archive_secret_2026")
+    return os.getenv("ARCHIVE_API_KEY", "ArchiveJarvisHost")
 
 def _headers() -> dict:
     return {"X-API-Key": _key(), "Content-Type": "application/json"}
