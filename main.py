@@ -3826,57 +3826,78 @@ class MediaHandler:
     @staticmethod
     async def describe_photo(image_bytes: bytes, question: str = "") -> str:
         """Анализирует фото через vision LLM — умный универсальный промпт."""
-        import base64
+        import base64, re as _re_vis
         b64 = base64.b64encode(image_bytes).decode()
 
-        # Умный системный промпт — определяет тип изображения и действует соответственно
-        system_prompt = """Ты — JARVIS, интеллектуальный ИИ-ассистент. Анализируй изображение умно:
+        q = (question or "").strip()
+        q_low = q.lower()
 
-• Если на фото МАТЕМАТИКА / ФИЗИКА / ХИМИЯ (уравнения, задачи, формулы) → реши задачу пошагово, дай ответ
-• Если на фото ТЕКСТ / ДОКУМЕНТ / СТАТЬЯ → кратко перескажи суть, выдели главное (не переписывай дословно)
-• Если на фото ГРАФИК / ДИАГРАММА / ТАБЛИЦА → объясни что показывает, выдели ключевые данные
-• Если на фото КОД / ПРОГРАММА → объясни что делает, найди ошибки если есть
-• Если на фото СКРИНШОТ ОШИБКИ → диагностируй проблему, предложи решение
-• Если на фото ЧЕРТЁЖ / СХЕМА → объясни устройство или принцип работы
-• Если на фото ФОТО МЕСТА / ОБЪЕКТА / ЧЕЛОВЕКА / ПРИРОДЫ → опиши что видишь, дай контекст
-• Если на фото ЕДА / РЕЦЕПТ → назови блюдо, если есть рецепт — перескажи кратко
-• Если пользователь задал конкретный вопрос — отвечай именно на него
+        # Определяем режим — пользователь просит краткий ответ?
+        _only_answer = any(w in q_low for w in [
+            "только ответ", "дай ответ", "ответ только", "just answer",
+            "only answer", "реши", "решение", "answer only",
+        ])
+        _translate = any(w in q_low for w in ["переведи", "перевод", "translate"])
 
-Отвечай на русском языке. Будь точным и полезным. Не пиши "на изображении я вижу" — сразу по делу."""
-
-        if question and len(question.strip()) > 2:
-            user_text = question.strip()
+        # Системный промпт — умный, без заголовков
+        if _only_answer:
+            system = (
+                "Ты — JARVIS. Пользователь просит ТОЛЬКО ответ — без объяснений, "
+                "без шагов, без заголовков, без markdown. "
+                "Если задача — дай ответ одной строкой. "
+                "Если несколько вопросов — нумерованный список только ответов. "
+                "Никакого лишнего текста."
+            )
+        elif _translate:
+            system = (
+                "Ты — переводчик. Переведи текст с фото. "
+                "Верни ТОЛЬКО перевод, без пояснений и заголовков."
+            )
         else:
-            user_text = "Проанализируй это изображение."
+            system = (
+                "Ты — JARVIS, интеллектуальный ИИ-ассистент. "
+                "Анализируй изображение и отвечай по-русски. Без markdown заголовков (## # ###). "
+                "Правила:\n"
+                "• Задача/уравнение/пример → реши, покажи ход решения, дай ответ\n"
+                "• Текст/документ → кратко перескажи суть, не переписывай дословно\n"
+                "• График/таблица/диаграмма → объясни что показывает, выдели ключевые цифры\n"
+                "• Код → объясни что делает, найди ошибки\n"
+                "• Скриншот ошибки → диагностируй, предложи решение\n"
+                "• Фото места/объекта → опиши что видишь\n"
+                "Если пользователь задал вопрос — отвечай именно на него. "
+                "Не начинай с 'На изображении'. Сразу по делу."
+            )
 
-        msgs = [{
-            "role": "system",
-            "content": system_prompt,
-        }, {
-            "role": "user",
-            "content": [
+        user_text = q if len(q) > 2 else "Проанализируй это изображение."
+
+        msgs = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text", "text": user_text}
-            ]
-        }]
+                {"type": "text",      "text": user_text}
+            ]}
+        ]
 
         import os as _os_vis, concurrent.futures as _cf_vis
-        _gk_vis = _os_vis.getenv("GROQ_API_KEY", "")
-        if not (_GROQ_AVAILABLE and _gk_vis):
+        _gk = _os_vis.getenv("GROQ_API_KEY", "")
+        if not (_GROQ_AVAILABLE and _gk):
             return "Сэр, для анализа фото нужен GROQ_API_KEY в .env"
+
         last_err = ""
         for model in MediaHandler.VISION_MODELS:
             try:
-                def _vis_call(_m=model):
-                    vc = _GroqClient(api_key=_gk_vis)
+                def _call(_m=model):
+                    vc = _GroqClient(api_key=_gk)
                     return vc.chat.completions.create(
                         model=_m, messages=msgs, max_completion_tokens=1200,
                     ).choices[0].message.content.strip()
                 loop = asyncio.get_event_loop()
-                with _cf_vis.ThreadPoolExecutor(max_workers=1) as _ex_vis:
+                with _cf_vis.ThreadPoolExecutor(max_workers=1) as ex:
                     result = await asyncio.wait_for(
-                        loop.run_in_executor(_ex_vis, _vis_call), timeout=45
+                        loop.run_in_executor(ex, _call), timeout=45
                     )
+                # Убираем markdown заголовки из ответа
+                result = _re_vis.sub(r'^#{1,4}\s+', '', result, flags=_re_vis.MULTILINE)
                 return result
             except asyncio.TimeoutError:
                 last_err = "timeout"; continue
