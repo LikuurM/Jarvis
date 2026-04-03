@@ -1,171 +1,156 @@
 """
-archive_client.py — HTTP-клиент Джарвиса для работы с Архивом знаний.
-Поддерживает двуязычный поиск: запрос переводится через Groq и ищется на обоих языках.
+archive_client.py — Telegram Bridge версия.
+Джарвис общается с Архивом через общую Telegram группу.
+
+Настройка:
+  ARCHIVE_BRIDGE_CHAT  — ID группы-моста (например -1001234567890)
+  ARCHIVE_BOT_ID       — ID Archive бота (узнать у @userinfobot)
+
+Протокол:
+  Джарвис отправляет:  REQ:abc123 SEARCH:запрос LIMIT:3
+  Архив отвечает:      RESP:abc123 [{"title":...,"snippet":...}]
+  
+  Джарвис отправляет:  REQ:abc123 PING
+  Архив отвечает:      RESP:abc123 OK
+  
+  Джарвис отправляет:  REQ:abc123 STATS
+  Архив отвечает:      RESP:abc123 {"docs":5,"pages":120,...}
 """
+import asyncio
+import json
+import uuid
 import os
 import logging
-import asyncio
-import concurrent.futures
-import httpx
 
-log = logging.getLogger("jarvis.archive_client")
-
-
-def _url() -> str:
-    return os.getenv("ARCHIVE_API_URL", "https://Archive.bothost.ru").rstrip("/")
-
-def _key() -> str:
-    return os.getenv("ARCHIVE_API_KEY", "ArchiveJarvisHost")
-
-def _headers() -> dict:
-    return {"X-API-Key": _key(), "Content-Type": "application/json"}
-
-def _groq_key() -> str:
-    return os.getenv("GROQ_API_KEY", "")
-
+log = logging.getLogger("jarvis.archive_bridge")
 
 # ─────────────────────────────────────────────────────────────────
-# Определение языка и перевод
+# Конфиг
 # ─────────────────────────────────────────────────────────────────
 
-def _is_latin(text: str) -> bool:
-    latin = sum(1 for c in text if c.isascii() and c.isalpha())
-    total = sum(1 for c in text if c.isalpha())
-    return total > 0 and latin / total > 0.6
+def _bridge_chat() -> int:
+    """ID группы-моста."""
+    return int(os.getenv("ARCHIVE_BRIDGE_CHAT", "0"))
+
+def _archive_bot_id() -> int:
+    """ID Archive бота — чтобы Джарвис слушал только его ответы."""
+    return int(os.getenv("ARCHIVE_BOT_ID", "0"))
+
+TIMEOUT = 12  # секунд ждать ответ
+
+# ─────────────────────────────────────────────────────────────────
+# Состояние: ожидающие запросы
+# ─────────────────────────────────────────────────────────────────
+
+_pending: dict[str, asyncio.Future] = {}
+_client = None   # Telethon клиент (регистрируется через register_client)
 
 
-async def _translate_query(query: str) -> str | None:
+def register_client(client):
+    """Регистрирует Telethon клиент Джарвиса для отправки сообщений."""
+    global _client
+    _client = client
+
+
+def handle_incoming(sender_id: int, text: str) -> bool:
     """
-    Переводит поисковый запрос через Groq.
-    Русский -> Английский, Английский -> Русский.
+    Вызывается из обработчика сообщений Джарвиса.
+    Если сообщение — ответ от Archive бота, разрешает ожидающий Future.
+    Возвращает True если сообщение было обработано.
     """
-    gk = _groq_key()
-    if not gk:
-        return None
+    archive_id = _archive_bot_id()
+    # Принимаем от Archive бота или от любого если ARCHIVE_BOT_ID не задан
+    if archive_id and sender_id != archive_id:
+        return False
+
+    if not text or not text.startswith("RESP:"):
+        return False
+
     try:
-        target = "Russian" if _is_latin(query) else "English"
+        # Формат: RESP:reqid данные
+        rest    = text[5:]   # убираем "RESP:"
+        sp      = rest.find(" ")
+        req_id  = rest[:sp] if sp != -1 else rest
+        payload = rest[sp+1:] if sp != -1 else ""
 
-        def _call():
-            from groq import Groq
-            client = Groq(api_key=gk)
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Translate this search query to {target}. "
-                        f"Return ONLY the translated text, no quotes, no explanation:\n{query}"
-                    )
-                }],
-                max_completion_tokens=60,
-                temperature=0,
-            )
-            return (resp.choices[0].message.content or "").strip()
-
-        loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            translated = await loop.run_in_executor(ex, _call)
-
-        if not translated or translated.lower() == query.lower():
-            return None
-        log.debug(f"📖 Архив перевод: «{query}» → «{translated}»")
-        return translated
-
+        fut = _pending.get(req_id)
+        if fut and not fut.done():
+            fut.set_result(payload)
+            log.debug(f"📬 Archive ответил на {req_id}")
+            return True
     except Exception as e:
-        log.debug(f"translate_query: {e}")
-        return None
+        log.debug(f"handle_incoming: {e}")
+
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────
-# Поиск
+# Отправка запроса и ожидание ответа
 # ─────────────────────────────────────────────────────────────────
 
-async def _search_one(cl: httpx.AsyncClient, query: str, limit: int) -> list:
-    try:
-        r = await cl.post(
-            f"{_url()}/search",
-            json={"query": query, "limit": limit},
-        )
-        if r.status_code == 200:
-            return r.json().get("results", [])
-    except Exception as e:
-        log.debug(f"_search_one: {e}")
-    return []
+async def _ask(command: str) -> str:
+    """Отправляет команду в группу-мост, ждёт ответа."""
+    chat = _bridge_chat()
+    if not chat or _client is None:
+        return ""
 
+    req_id = uuid.uuid4().hex[:10]
+    loop   = asyncio.get_event_loop()
+    fut    = loop.create_future()
+    _pending[req_id] = fut
+
+    try:
+        await _client.send_message(chat, f"REQ:{req_id} {command}")
+        result = await asyncio.wait_for(fut, timeout=TIMEOUT)
+        return result
+    except asyncio.TimeoutError:
+        log.debug(f"⏱ Archive timeout ({command[:30]})")
+        return ""
+    except Exception as e:
+        log.debug(f"_ask error: {e}")
+        return ""
+    finally:
+        _pending.pop(req_id, None)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Публичный API (такой же как HTTP версия)
+# ─────────────────────────────────────────────────────────────────
 
 async def archive_search(query: str, limit: int = 3) -> str:
-    """
-    Двуязычный поиск в Архиве:
-    1. Ищет оригинальным запросом
-    2. Переводит запрос через Groq
-    3. Ищет переведённым запросом
-    4. Объединяет результаты без дублей
-    """
+    """Поиск в архиве через Telegram мост."""
+    raw = await _ask(f"SEARCH:{query} LIMIT:{limit}")
+    if not raw:
+        return ""
     try:
-        async with httpx.AsyncClient(
-            timeout=10, verify=False, headers=_headers()
-        ) as cl:
-            # Запускаем поиск и перевод параллельно
-            results_orig, translated = await asyncio.gather(
-                _search_one(cl, query, limit),
-                _translate_query(query),
-                return_exceptions=True,
-            )
-
-            if isinstance(results_orig, Exception):
-                results_orig = []
-            if isinstance(translated, Exception):
-                translated = None
-
-            results_trans = []
-            if translated:
-                results_trans = await _search_one(cl, translated, limit)
-
-            # Дедупликация по (id, page_num)
-            seen, merged = set(), []
-            for res in list(results_orig) + list(results_trans):
-                key = (res.get("id"), res.get("page_num"))
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(res)
-
-            if not merged:
-                return ""
-
-            parts = []
-            for res in merged[:limit * 2]:
-                title   = res.get("title", "Документ")
-                snippet = (res.get("snippet") or "")[:500]
-                cat     = res.get("category", "")
-                lang    = res.get("language", "")
-                meta    = " | ".join(filter(None, [cat, lang]))
-                meta_s  = f" [{meta}]" if meta else ""
-                parts.append(f"[{title}{meta_s}]\n{snippet}")
-
-            return "\n\n---\n\n".join(parts)
-
+        items = json.loads(raw)
+        if not items:
+            return ""
+        parts = []
+        for r in items[:limit * 2]:
+            title   = r.get("title", "Документ")
+            snippet = (r.get("snippet") or "")[:400]
+            cat     = r.get("category", "")
+            meta    = f" [{cat}]" if cat else ""
+            parts.append(f"[{title}{meta}]\n{snippet}")
+        return "\n\n---\n\n".join(parts)
     except Exception as e:
-        log.debug(f"archive_search: {e}")
+        log.debug(f"archive_search parse: {e}")
         return ""
 
 
 async def archive_health() -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=4, verify=False) as cl:
-            r = await cl.get(f"{_url()}/health")
-            return r.status_code == 200
-    except Exception:
-        return False
+    """Проверяет доступность Archive бота."""
+    result = await _ask("PING")
+    return result.strip() == "OK"
 
 
 async def archive_stats() -> dict:
+    """Статистика архива."""
+    raw = await _ask("STATS")
+    if not raw:
+        return {}
     try:
-        async with httpx.AsyncClient(
-            timeout=5, verify=False, headers=_headers()
-        ) as cl:
-            r = await cl.get(f"{_url()}/stats")
-            if r.status_code == 200:
-                return r.json()
-    except Exception as e:
-        log.debug(f"archive_stats: {e}")
-    return {}
+        return json.loads(raw)
+    except Exception:
+        return {}

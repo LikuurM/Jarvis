@@ -33,16 +33,19 @@ import db as _db
 # ── Архив знаний (опционально) ────────────────────────────────
 try:
     from archive_client import (
-        archive_search  as _archive_search,
-        archive_health  as _archive_health,
-        archive_stats   as _archive_stats,
+        archive_search    as _archive_search,
+        archive_health    as _archive_health,
+        archive_stats     as _archive_stats,
+        register_client   as _archive_register,
+        handle_incoming   as _archive_handle,
     )
-    # Архив доступен если задан URL ИЛИ если archive_client.py есть (там захардкожен IP)
     _ARCHIVE_AVAILABLE = True
 except ImportError:
-    _archive_search  = None
-    _archive_health  = None
-    _archive_stats   = None
+    _archive_search   = None
+    _archive_health   = None
+    _archive_stats    = None
+    _archive_register = None
+    _archive_handle   = None
     _ARCHIVE_AVAILABLE = False
 _jarvis_db = _db.get_db()
 
@@ -4962,6 +4965,13 @@ class JarvisTelegram:
         mode = "🤖 Бот" if self.is_bot else "👤 Пользователь"
         logger.info(f"Telegram: {mode} @{me.username}")
 
+        # ── Регистрируем Telegram клиент для Archive bridge ───────
+        if _archive_register:
+            _archive_register(self.client)
+            bridge_chat = os.getenv("ARCHIVE_BRIDGE_CHAT", "")
+            if bridge_chat:
+                logger.info(f"🌉 Archive Bridge: чат {bridge_chat}")
+
         print("JARVIS запущен")
 
         # ── Регистрация обработчика сообщений ────────────────
@@ -4975,6 +4985,11 @@ class JarvisTelegram:
                     txt  = msg.text or msg.message or ""
                     cid  = event.chat_id
                     sid  = event.sender_id or 0
+
+                    # ── Archive Bridge: перехватываем RESP: ───────────
+                    if txt and txt.startswith("RESP:") and _archive_handle:
+                        if _archive_handle(sid, txt):
+                            return  # сообщение обработано bridge'ем
 
                     if txt and cid:
                         sndr = str(sid)
