@@ -5851,12 +5851,10 @@ class JarvisTelegram:
 
         _typing = TypingManager(self.client, event.chat_id)
         await _typing.start()
-        _draft_msg  = None
-        _last_edit  = 0.0
+        _draft_msg = None
 
         try:
             _draft_msg = await event.reply("✦")
-            _last_edit = 0.0
 
             response = await self.agent.process(
                 text, sender_id=sender_id, username=username, chat_id=chat_id
@@ -5866,47 +5864,51 @@ class JarvisTelegram:
                 if _draft_msg:
                     try:
                         import time as _t
-                        # Красивый стриминг — порции растут с замедлением
-                        # Первый символ быстро, потом медленнее — эффект "думает"
-                        total   = len(response)
-                        shown   = 0
-                        cursors = ["▌", "▍", "▎", "▏", "▎", "▍"]
-                        ci      = 0
+                        total  = len(response)
+                        shown  = 0
+                        last_e = 0.0
 
-                        # Шаги: сначала маленькие порции, потом крупнее
+                        # Посимвольный стриминг с натуральным ритмом
+                        # Telegram лимит ~20 правок/мин = 1 правка каждые 3с
+                        # Показываем накопленный текст каждые 2.5с — красиво и в лимите
+                        EDIT_EVERY = 2.5   # секунд между правками
+                        CHAR_SPEED = 0.04  # секунд на символ (25 симв/сек)
+
                         while shown < total:
-                            # Размер порции зависит от прогресса
-                            if shown < total * 0.3:
-                                step = max(15, total // 40)   # начало — медленно
-                            elif shown < total * 0.7:
-                                step = max(30, total // 25)   # середина — быстрее
-                            else:
-                                step = max(50, total // 15)   # конец — быстро
+                            # Добавляем один символ
+                            shown += 1
+                            chunk  = response[:shown]
+                            now_t  = _t.monotonic()
 
-                            shown = min(shown + step, total)
-                            chunk = response[:shown]
-                            now   = _t.monotonic()
-
-                            if now - _last_edit >= 1.2:
-                                cursor = cursors[ci % len(cursors)]
-                                ci += 1
+                            # Отправляем обновление если прошло достаточно времени
+                            if now_t - last_e >= EDIT_EVERY or shown == total:
                                 try:
                                     if shown < total:
-                                        await _draft_msg.edit(chunk + cursor)
+                                        await _draft_msg.edit(chunk + "▌")
                                     else:
                                         await _draft_msg.edit(response)
-                                    _last_edit = now
+                                    last_e = now_t
                                 except Exception:
                                     break
 
-                            await asyncio.sleep(0.08)
+                            # Скорость: пробелы быстрее, знаки препинания — пауза
+                            c = response[shown - 1]
+                            if c in '.!?…\n':
+                                await asyncio.sleep(CHAR_SPEED * 4)
+                            elif c in ',;:—–':
+                                await asyncio.sleep(CHAR_SPEED * 2)
+                            elif c == ' ':
+                                await asyncio.sleep(CHAR_SPEED * 0.3)
+                            else:
+                                await asyncio.sleep(CHAR_SPEED)
 
-                        # Гарантируем финальный вариант без курсора
+                        # Финальная правка без курсора (на случай если последняя с ▌)
                         try:
                             await _draft_msg.edit(response)
                         except Exception:
                             pass
                         _draft_msg = None
+
                     except Exception:
                         try: await _draft_msg.delete()
                         except: pass
