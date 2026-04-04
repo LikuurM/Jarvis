@@ -2756,8 +2756,18 @@ class JarvisAgent:
             return full_answer
 
         # ── Поиск в Архиве знаний ─────────────────────────────
+        # Ищем только для реальных вопросов (>4 слов), не для casual
         _archive_ctx = ""
-        if _ARCHIVE_AVAILABLE and _archive_search:
+        _q_words = len(q_lower.split())
+        _is_real_question = (
+            _q_words >= 3 and
+            not any(t in q_lower for t in [
+                "привет", "пока", "хай", "hello", "ок", "окей", "спасибо",
+                "благодарю", "понял", "ясно", "хорошо", "ладно", "да", "нет",
+                "как дела", "что делаешь", "ты тут", "ты здесь",
+            ])
+        )
+        if _ARCHIVE_AVAILABLE and _archive_search and _is_real_question:
             try:
                 _archive_ctx = await _archive_search(query, limit=3)
             except Exception:
@@ -5841,21 +5851,71 @@ class JarvisTelegram:
 
         _typing = TypingManager(self.client, event.chat_id)
         await _typing.start()
-        _wait_msg = None
+        _draft_msg  = None
+        _last_edit  = 0.0
+        _EDIT_DELAY = 1.5  # секунды между обновлениями (лимит Telegram ~20 правок/мин)
+
+        async def _stream_to_msg(draft, token_gen):
+            """Обновляет черновик сообщения по мере прихода токенов."""
+            nonlocal _last_edit
+            buf = "✦"
+            import time as _time
+            async for chunk in token_gen:
+                buf += chunk
+                now = _time.monotonic()
+                if now - _last_edit >= _EDIT_DELAY and len(buf) > 1:
+                    try:
+                        await draft.edit(buf)
+                        _last_edit = now
+                    except Exception:
+                        pass
+            return buf
+
         try:
-            _wait_msg = await event.reply("⏳ Секунду, Сэр...")
+            _draft_msg  = await event.reply("✦")
+            _last_edit  = 0.0
+
             response = await self.agent.process(
                 text, sender_id=sender_id, username=username, chat_id=chat_id
             )
-            if _wait_msg:
-                await _wait_msg.delete()
-                _wait_msg = None
+
             if response:
-                await event.reply(response)
+                # Имитируем потоковый вывод: редактируем с нарастающим текстом
+                if _draft_msg:
+                    try:
+                        # Показываем нарастание порциями по ~80 символов
+                        import asyncio as _a, time as _t
+                        chunk_size = 80
+                        shown = ""
+                        for i in range(0, len(response), chunk_size):
+                            shown = response[: i + chunk_size]
+                            now = _t.monotonic()
+                            if now - _last_edit >= _EDIT_DELAY:
+                                try:
+                                    await _draft_msg.edit(shown + " ▌")
+                                    _last_edit = now
+                                except Exception:
+                                    break
+                            await _a.sleep(0.05)
+                        # Финальный вариант без курсора
+                        await _draft_msg.edit(response)
+                        _draft_msg = None
+                    except Exception:
+                        try:
+                            await _draft_msg.delete()
+                        except Exception:
+                            pass
+                        await event.reply(response)
+                        _draft_msg = None
+            else:
+                if _draft_msg:
+                    await _draft_msg.delete()
+                    _draft_msg = None
+
         except Exception as _pe:
             logger.error(f"❌ agent.process: {_pe}")
-            if _wait_msg:
-                try: await _wait_msg.delete()
+            if _draft_msg:
+                try: await _draft_msg.delete()
                 except: pass
         finally:
             await _typing.stop()
@@ -6086,41 +6146,60 @@ async def main():
         # Проверяем подключение к Архиву и уведомляем владельца
         async def _check_archive_on_start():
             """Проверяет Архив после подключения Telegram и шлёт статус владельцу."""
-            await asyncio.sleep(5)  # ждём пока Telegram поднимется
+            await asyncio.sleep(8)
             if not config.OWNER_ID:
                 return
+
+            bridge_chat = os.getenv("ARCHIVE_BRIDGE_CHAT", "")
             archive_url = os.getenv("ARCHIVE_API_URL", "")
+
+            # Bridge режим — проверяем через PING
+            if bridge_chat and not archive_url:
+                try:
+                    if _archive_health:
+                        ok = await _archive_health()
+                        if ok:
+                            st = (await _archive_stats()) if _archive_stats else {}
+                            await tg.client.send_message(
+                                config.OWNER_ID,
+                                f"✅ **Архив знаний подключён** (Telegram Bridge), Сэр.\n"
+                                f"📄 Документов: **{st.get('docs','?')}** | "
+                                f"📃 Страниц: **{st.get('pages','?')}**"
+                            )
+                        else:
+                            await tg.client.send_message(
+                                config.OWNER_ID,
+                                f"⚠️ **Archive бот не отвечает**, Сэр.\n"
+                                f"Убедитесь что Archive бот запущен и находится в группе `{bridge_chat}`."
+                            )
+                except Exception as _e:
+                    logger.warning(f"⚠️ Archive bridge check: {_e}")
+                return
+
+            # HTTP режим
             if not archive_url:
                 return  # Архив не настроен — молчим
             try:
                 if _archive_health is None:
-                    raise ImportError("archive_client.py не найден рядом с main.py")
+                    raise ImportError("archive_client.py не найден")
                 ok = await _archive_health()
                 if not ok:
-                    raise ConnectionError(
-                        f"сервер не ответил — убедитесь что Archive бот запущен "
-                        f"и URL={archive_url} верный"
-                    )
-                st     = (await _archive_stats()) if _archive_stats else {}
-                _docs  = st.get("docs", "?")
-                _pages = st.get("pages", "?")
+                    raise ConnectionError(f"сервер не ответил (URL={archive_url})")
+                st    = (await _archive_stats()) if _archive_stats else {}
                 await tg.client.send_message(
                     config.OWNER_ID,
                     f"✅ **Архив знаний подключён**, Сэр.\n"
-                    f"📄 Документов: **{_docs}** | 📃 Страниц: **{_pages}**"
+                    f"📄 Документов: **{st.get('docs','?')}** | "
+                    f"📃 Страниц: **{st.get('pages','?')}**"
                 )
-                logger.info(f"✅ Архив знаний доступен: {_docs} документов")
             except Exception as _ae:
                 logger.warning(f"⚠️ Архив недоступен: {_ae}")
                 try:
                     await tg.client.send_message(
                         config.OWNER_ID,
                         f"⚠️ **Архив знаний недоступен**, Сэр.\n"
-                        f"URL: `{archive_url}`\n"
-                        f"Ошибка: `{str(_ae)[:150]}`\n\n"
-                        f"Проверьте что Archive бот запущен и в .env Джарвиса "
-                        f"правильно заданы `ARCHIVE_API_URL` и `ARCHIVE_API_KEY`.\n"
-                        f"Джарвис работает без архива — отвечаю из своих знаний."
+                        f"Ошибка: `{str(_ae)[:100]}`\n"
+                        f"Работаю без архива."
                     )
                 except Exception:
                     pass
