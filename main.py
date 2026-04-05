@@ -2755,8 +2755,7 @@ class JarvisAgent:
             self.chat_history.save_message(sender_id, "jarvis", full_answer)
             return full_answer
 
-        # ── Поиск в Архиве знаний ─────────────────────────────
-        # Ищем только для реальных вопросов (>4 слов), не для casual
+        # ── Поиск в базе знаний Джарвиса (knowledge.db) ──────────
         _archive_ctx = ""
         _q_words = len(q_lower.split())
         _is_real_question = (
@@ -2767,9 +2766,9 @@ class JarvisAgent:
                 "как дела", "что делаешь", "ты тут", "ты здесь",
             ])
         )
-        if _ARCHIVE_AVAILABLE and _archive_search and _is_real_question:
+        if _KB_AVAILABLE and _kb and _is_real_question:
             try:
-                _archive_ctx = await _archive_search(query, limit=3)
+                _archive_ctx = await _kb.search_async(query, limit=3)
             except Exception:
                 pass
 
@@ -2859,7 +2858,7 @@ class JarvisAgent:
         # AI отвечает на основе найденных данных
         # Добавляем данные из Архива к контексту
         if _archive_ctx:
-            web = f"[Из архива знаний]:\n{_archive_ctx}\n\n[Из интернета]:\n{web}"
+            web = f"[Из базы знаний Джарвиса]:\n{_archive_ctx}\n\n[Из интернета]:\n{web}"
         answer = await self.call_llm(
             query=query, context=web,
             rag_context=rag_context,
@@ -4975,13 +4974,6 @@ class JarvisTelegram:
         mode = "🤖 Бот" if self.is_bot else "👤 Пользователь"
         logger.info(f"Telegram: {mode} @{me.username}")
 
-        # ── Регистрируем Telegram клиент для Archive bridge ───────
-        if _archive_register:
-            _archive_register(self.client)
-            bridge_chat = os.getenv("ARCHIVE_BRIDGE_CHAT", "")
-            if bridge_chat:
-                logger.info(f"🌉 Archive Bridge: чат {bridge_chat}")
-
         print("JARVIS запущен")
 
         # ── Регистрация обработчика сообщений ────────────────
@@ -4996,10 +4988,7 @@ class JarvisTelegram:
                     cid  = event.chat_id
                     sid  = event.sender_id or 0
 
-                    # ── Archive Bridge: перехватываем RESP: ───────────
-                    if txt and txt.startswith("RESP:") and _archive_handle:
-                        if _archive_handle(sid, txt):
-                            return  # сообщение обработано bridge'ем
+                    # ── Archive Bridge: убран ─────────────────────────────
 
                     if txt and cid:
                         sndr = str(sid)
@@ -5304,6 +5293,35 @@ class JarvisTelegram:
                         for attr in doc.attributes:
                             fname = getattr(attr, "file_name", "") or fname
                     fname = fname or "document"
+
+                    # Загрузка knowledge.db (база знаний Джарвиса)
+                    if is_owner and fname == "knowledge.db":
+                        await event.reply("⏳ Загружаю базу знаний, Сэр...")
+                        try:
+                            file_bytes = await self.client.download_media(msg, bytes)
+                            kb_path    = os.path.join(os.getenv("DATA_DIR", "/app/data"), "knowledge.db")
+                            with open(kb_path, "wb") as fh:
+                                fh.write(file_bytes)
+                            # Перезагружаем KB
+                            if _KB_AVAILABLE and _kb:
+                                _kb.reload(kb_path)
+                                stats = _kb.stats()
+                                await event.reply(
+                                    f"✅ **База знаний обновлена**, Сэр!\n\n"
+                                    f"📄 Документов: **{stats.get('docs',0)}**\n"
+                                    f"📂 Категорий: **{stats.get('categories',0)}**\n"
+                                    f"📝 Символов: **{stats.get('chars',0):,}**\n\n"
+                                    f"Джарвис будет использовать новые знания."
+                                )
+                            else:
+                                await event.reply(
+                                    "✅ **knowledge.db сохранена**, Сэр.\n"
+                                    "Перезапустите Джарвиса для активации базы знаний."
+                                )
+                        except Exception as _kbe:
+                            await event.reply(f"❌ Ошибка загрузки базы знаний: {_kbe}")
+                        return
+
                     # Восстановление БД из .db файла (только от владельца в ЛС)
                     if is_owner and fname.endswith(".db") and "Jarvis" in fname:
                         await event.reply("\u23f3 Восстанавливаю базу данных, Сэр...")
@@ -6151,68 +6169,7 @@ async def main():
             logger.warning(f"⚠️ VK бот не запущен: {_vk_e}")
 
         # Проверяем подключение к Архиву и уведомляем владельца
-        async def _check_archive_on_start():
-            """Проверяет Архив после подключения Telegram и шлёт статус владельцу."""
-            await asyncio.sleep(8)
-            if not config.OWNER_ID:
-                return
-
-            bridge_chat = os.getenv("ARCHIVE_BRIDGE_CHAT", "")
-            archive_url = os.getenv("ARCHIVE_API_URL", "")
-
-            # Bridge режим — проверяем через PING
-            if bridge_chat and not archive_url:
-                try:
-                    if _archive_health:
-                        ok = await _archive_health()
-                        if ok:
-                            st = (await _archive_stats()) if _archive_stats else {}
-                            await tg.client.send_message(
-                                config.OWNER_ID,
-                                f"✅ **Архив знаний подключён** (Telegram Bridge), Сэр.\n"
-                                f"📄 Документов: **{st.get('docs','?')}** | "
-                                f"📃 Страниц: **{st.get('pages','?')}**"
-                            )
-                        else:
-                            await tg.client.send_message(
-                                config.OWNER_ID,
-                                f"⚠️ **Archive бот не отвечает**, Сэр.\n"
-                                f"Убедитесь что Archive бот запущен и находится в группе `{bridge_chat}`."
-                            )
-                except Exception as _e:
-                    logger.warning(f"⚠️ Archive bridge check: {_e}")
-                return
-
-            # HTTP режим
-            if not archive_url:
-                return  # Архив не настроен — молчим
-            try:
-                if _archive_health is None:
-                    raise ImportError("archive_client.py не найден")
-                ok = await _archive_health()
-                if not ok:
-                    raise ConnectionError(f"сервер не ответил (URL={archive_url})")
-                st    = (await _archive_stats()) if _archive_stats else {}
-                await tg.client.send_message(
-                    config.OWNER_ID,
-                    f"✅ **Архив знаний подключён**, Сэр.\n"
-                    f"📄 Документов: **{st.get('docs','?')}** | "
-                    f"📃 Страниц: **{st.get('pages','?')}**"
-                )
-            except Exception as _ae:
-                logger.warning(f"⚠️ Архив недоступен: {_ae}")
-                try:
-                    await tg.client.send_message(
-                        config.OWNER_ID,
-                        f"⚠️ **Архив знаний недоступен**, Сэр.\n"
-                        f"Ошибка: `{str(_ae)[:100]}`\n"
-                        f"Работаю без архива."
-                    )
-                except Exception:
-                    pass
-
-        tasks = [asyncio.create_task(tg.start()),
-                 asyncio.create_task(_check_archive_on_start())]
+        tasks = [asyncio.create_task(tg.start())]
 
         # GroupMonitor запускается только если есть user.session
         from pathlib import Path as _Path
