@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  # ── JARVIS основной бот ───────────────────────────────────────────────────
+  jarvis:
+    build: .
+    container_name: jarvis_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # БД и ChromaDB
+      - ./logs:/app/logs          # логи
+      - ./backups:/app/backups    # бекапы
+      - ./uploads:/app/uploads    # временные файлы
+    ports:
+      - "8000:8000"               # FastAPI для iPhone
+    depends_on:
+      - searxng
+    networks:
+      - jarvis_net
+
+  # ── SearXNG — бесплатный self-hosted поиск ───────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: jarvis_searxng
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
+    networks:
+      - jarvis_net
+
+networks:
+  jarvis_net:
+    driver: bridge
+
+volumes:
+  jarvis_data:
